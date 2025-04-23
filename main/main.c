@@ -5,89 +5,140 @@
 
 #include "pico/stdlib.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
 #include "mpu6050.h"
 
 #include "Fusion.h"
-#define SAMPLE_PERIOD (0.01f) // replace this with actual sample period
 
-const int MPU_ADDRESS = 0x68;
-const int I2C_SDA_GPIO = 4;
-const int I2C_SCL_GPIO = 5;
+#define SAMPLE_INTERVAL_SEC (0.01f)    // Período de amostragem em segundos
 
-static void mpu6050_reset() {
-    // Two byte reset. First byte register, second byte data
-    // There are a load more options to set up the device in different ways that could be added here
-    uint8_t buf[] = {0x6B, 0x00};
-    i2c_write_blocking(i2c_default, MPU_ADDRESS, buf, 2, false);
+static const int MPU_ADDR       = 0x68;
+static const int PIN_I2C_SDA    = 4;
+static const int PIN_I2C_SCL    = 5;
+
+typedef struct {
+    uint8_t axis_id;   // 0 = Roll, 1 = Pitch, 2 = Aceleração X
+    int16_t value;     // Valor convertido
+} IMUMessage_t;
+
+static QueueHandle_t imuQueue;
+
+// Reinicia o sensor para o modo operacional
+static void reset_mpu6050(void) {
+    uint8_t cmd[2] = { 0x6B, 0x00 };
+    i2c_write_blocking(i2c_default, MPU_ADDR, cmd, 2, false);
 }
 
-static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp) {
-    // For this particular device, we send the device the register we want to read
-    // first, then subsequently read from the device. The register is auto incrementing
-    // so we don't need to keep sending the register we want, just the first.
+// Lê 3 eixos de aceleração, giroscópio e temperatura bruta
+static void read_mpu6050_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp) {
+    uint8_t buf[6];
+    uint8_t reg;
 
-    uint8_t buffer[6];
+    // Leitura de aceleração (0x3B…0x40)
+    reg = 0x3B;
+    i2c_write_blocking(i2c_default, MPU_ADDR, &reg, 1, true);
+    i2c_read_blocking(i2c_default, MPU_ADDR, buf, 6, false);
+    for (int i = 0; i < 3; i++)
+        accel[i] = (buf[2*i] << 8) | buf[2*i+1];
 
-    // Start reading acceleration registers from register 0x3B for 6 bytes
-    uint8_t val = 0x3B;
-    i2c_write_blocking(i2c_default, MPU_ADDRESS, &val, 1, true); // true to keep master control of bus
-    i2c_read_blocking(i2c_default, MPU_ADDRESS, buffer, 6, false);
+    // Leitura de giroscópio (0x43…0x48)
+    reg = 0x43;
+    i2c_write_blocking(i2c_default, MPU_ADDR, &reg, 1, true);
+    i2c_read_blocking(i2c_default, MPU_ADDR, buf, 6, false);
+    for (int i = 0; i < 3; i++)
+        gyro[i] = (buf[2*i] << 8) | buf[2*i+1];
 
-    for (int i = 0; i < 3; i++) {
-        accel[i] = (buffer[i * 2] << 8 | buffer[(i * 2) + 1]);
-    }
-
-    // Now gyro data from reg 0x43 for 6 bytes
-    // The register is auto incrementing on each read
-    val = 0x43;
-    i2c_write_blocking(i2c_default, MPU_ADDRESS, &val, 1, true);
-    i2c_read_blocking(i2c_default, MPU_ADDRESS, buffer, 6, false);  // False - finished with bus
-
-    for (int i = 0; i < 3; i++) {
-        gyro[i] = (buffer[i * 2] << 8 | buffer[(i * 2) + 1]);;
-    }
-
-    // Now temperature from reg 0x41 for 2 bytes
-    // The register is auto incrementing on each read
-    val = 0x41;
-    i2c_write_blocking(i2c_default, MPU_ADDRESS, &val, 1, true);
-    i2c_read_blocking(i2c_default, MPU_ADDRESS, buffer, 2, false);  // False - finished with bus
-
-    *temp = buffer[0] << 8 | buffer[1];
+    // Leitura de temperatura (0x41…0x42)
+    reg = 0x41;
+    i2c_write_blocking(i2c_default, MPU_ADDR, &reg, 1, true);
+    i2c_read_blocking(i2c_default, MPU_ADDR, buf, 2, false);
+    *temp = (buf[0] << 8) | buf[1];
 }
 
-void mpu6050_task(void *p) {
-    // configuracao do I2C
-    i2c_init(i2c_default, 400 * 1000);
-    gpio_set_function(I2C_SDA_GPIO, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL_GPIO, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA_GPIO);
-    gpio_pull_up(I2C_SCL_GPIO);
+// Tarefa que faz leitura do MPU, fusão de dados e empacotamento para fila
+void vTaskMPU(void *pvParameters) {
+    // Inicializa I2C a 400 kHz
+    i2c_init(i2c_default, 400000);
+    gpio_set_function(PIN_I2C_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(PIN_I2C_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(PIN_I2C_SDA);
+    gpio_pull_up(PIN_I2C_SCL);
 
-    mpu6050_reset();
-    int16_t acceleration[3], gyro[3], temp;
+    FusionAhrs fusion;
+    FusionAhrsInitialise(&fusion);
+    reset_mpu6050();
 
-    while(1) {
-        // leitura da MPU, sem fusao de dados
-        mpu6050_read_raw(acceleration, gyro, &temp);
-        printf("Acc. X = %d, Y = %d, Z = %d\n", acceleration[0], acceleration[1], acceleration[2]);
-        printf("Gyro. X = %d, Y = %d, Z = %d\n", gyro[0], gyro[1], gyro[2]);
-        printf("Temp. = %f\n", (temp / 340.0) + 36.53);
+    int16_t accel_raw[3], gyro_raw[3], temp_raw;
+
+    for (;;) {
+        read_mpu6050_raw(accel_raw, gyro_raw, &temp_raw);
+
+        FusionVector gyroVec = {
+            .axis.x = gyro_raw[0] / 131.0f,
+            .axis.y = gyro_raw[1] / 131.0f,
+            .axis.z = gyro_raw[2] / 131.0f,
+        };
+        FusionVector accelVec = {
+            .axis.x = accel_raw[0] / 16384.0f,
+            .axis.y = accel_raw[1] / 16384.0f,
+            .axis.z = accel_raw[2] / 16384.0f,
+        };
+
+        FusionAhrsUpdateNoMagnetometer(&fusion, gyroVec, accelVec, SAMPLE_INTERVAL_SEC);
+        FusionEuler angles = FusionQuaternionToEuler(FusionAhrsGetQuaternion(&fusion));
+
+        // Enviar Roll e Pitch
+        IMUMessage_t msg;
+        msg.axis_id = 0;
+        msg.value   = (int16_t)angles.angle.roll;
+        xQueueSend(imuQueue, &msg, 0);
+
+        msg.axis_id = 1;
+        msg.value   = (int16_t)angles.angle.pitch;
+        xQueueSend(imuQueue, &msg, 0);
+
+        // Se aceleração repentina no X ultrapassar threshold de 1.5g
+        int16_t accelXmg = (int16_t)(accelVec.axis.x * 100);
+        if (abs(accelXmg) > 100) {
+            msg.axis_id = 2;
+            msg.value   = accelXmg;
+            xQueueSend(imuQueue, &msg, 0);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-int main() {
-    stdio_init_all();
+// Tarefa que consome da fila e transmite via UART em pacotes de 4 bytes
+void vTaskUART(void *pvParameters) {
+    uart_init(uart0, 115200);
+    gpio_set_function(0, GPIO_FUNC_UART);
+    gpio_set_function(1, GPIO_FUNC_UART);
 
-    xTaskCreate(mpu6050_task, "mpu6050_Task 1", 8192, NULL, 1, NULL);
+    IMUMessage_t received;
+    uint8_t packet[4];
+
+    for (;;) {
+        if (xQueueReceive(imuQueue, &received, pdMS_TO_TICKS(100))) {
+            packet[0] = 0xFF;
+            packet[1] = received.axis_id;
+            packet[2] = (uint8_t)(received.value & 0xFF);
+            packet[3] = (uint8_t)((received.value >> 8) & 0xFF);
+            uart_write_blocking(uart0, packet, sizeof(packet));
+        }
+    }
+}
+
+int main(void) {
+    stdio_init_all();
+    imuQueue = xQueueCreate(32, sizeof(IMUMessage_t));
+
+    xTaskCreate(vTaskMPU,  "MPU_Task",  8192, NULL, 1, NULL);
+    xTaskCreate(vTaskUART, "UART_Task", 4096, NULL, 1, NULL);
 
     vTaskStartScheduler();
-
-    while (true)
-        ;
+    for (;;);
 }
